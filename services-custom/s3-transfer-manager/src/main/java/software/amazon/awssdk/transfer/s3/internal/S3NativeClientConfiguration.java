@@ -16,22 +16,39 @@
 package software.amazon.awssdk.transfer.s3.internal;
 
 
+import static software.amazon.awssdk.core.client.config.SdkAdvancedAsyncClientOption.FUTURE_COMPLETION_EXECUTOR;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import software.amazon.awssdk.annotations.SdkInternalApi;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.core.client.config.ClientAsyncConfiguration;
 import software.amazon.awssdk.crt.auth.credentials.CredentialsProvider;
 import software.amazon.awssdk.crt.io.ClientBootstrap;
 import software.amazon.awssdk.regions.providers.DefaultAwsRegionProviderChain;
 import software.amazon.awssdk.transfer.s3.SizeConstant;
+import software.amazon.awssdk.utils.IoUtils;
+import software.amazon.awssdk.utils.Logger;
 import software.amazon.awssdk.utils.SdkAutoCloseable;
+import software.amazon.awssdk.utils.ThreadFactoryBuilder;
 
 /**
  * Internal client configuration resolver
  */
 @SdkInternalApi
 public class S3NativeClientConfiguration implements SdkAutoCloseable {
+    private static final Logger log = Logger.loggerFor(S3NativeClientConfiguration.class);
     private static final long DEFAULT_PART_SIZE_IN_BYTES = 8L * SizeConstant.MB;
     private static final long DEFAULT_TARGET_THROUGHPUT_IN_GBPS = 5;
+    private final List<Object> managedResources;
     private final String signingRegion;
     private final ClientBootstrap clientBootstrap;
     private final CrtCredentialsProviderAdapter credentialProviderAdapter;
@@ -39,15 +56,21 @@ public class S3NativeClientConfiguration implements SdkAutoCloseable {
     private final long partSizeInBytes;
     private final double targetThroughputInGbps;
     private final int maxConcurrency;
+    private final Executor futureCompletionExecutor;
 
     public S3NativeClientConfiguration(Builder builder) {
+        this.managedResources = new ArrayList<>();
         this.signingRegion = builder.signingRegion == null ? DefaultAwsRegionProviderChain.builder().build().getRegion().id() :
                              builder.signingRegion;
         this.clientBootstrap = new ClientBootstrap(null, null);
+        managedResources.add(clientBootstrap);
+
         this.credentialProviderAdapter =
             builder.credentialsProvider == null ?
             new CrtCredentialsProviderAdapter(DefaultCredentialsProvider.create()) :
             new CrtCredentialsProviderAdapter(builder.credentialsProvider);
+        managedResources.add(credentialProviderAdapter);
+
         this.credentialsProvider = credentialProviderAdapter.crtCredentials();
 
         this.partSizeInBytes = builder.partSizeInBytes == null ? DEFAULT_PART_SIZE_IN_BYTES :
@@ -57,6 +80,8 @@ public class S3NativeClientConfiguration implements SdkAutoCloseable {
 
         // Using 0 so that CRT will calculate it based on targetThroughputGbps
         this.maxConcurrency = builder.maxConcurrency == null ? 0 : builder.maxConcurrency;
+
+        this.futureCompletionExecutor = resolveAsyncFutureCompletionExecutor(builder.asynConfiguration);
     }
 
     public static Builder builder() {
@@ -87,11 +112,47 @@ public class S3NativeClientConfiguration implements SdkAutoCloseable {
         return maxConcurrency;
     }
 
+    public Executor futureCompletionExecutor() {
+        return futureCompletionExecutor;
+    }
+
+    /**
+     * Finalize which async executor service will be used for the created client. The default async executor
+     * service has at least 8 core threads and can scale up to at least 64 threads when needed depending
+     * on the number of processors available.
+     */
+    private Executor resolveAsyncFutureCompletionExecutor(ClientAsyncConfiguration config) {
+        Supplier<Executor> defaultExecutor = () -> {
+            int processors = Runtime.getRuntime().availableProcessors();
+            int corePoolSize = Math.max(8, processors);
+            int maxPoolSize = Math.max(64, processors * 2);
+            ThreadPoolExecutor executor = new ThreadPoolExecutor(corePoolSize, maxPoolSize,
+                                                                 10, TimeUnit.SECONDS,
+                                                                 new LinkedBlockingQueue<>(1_000),
+                                                                 new ThreadFactoryBuilder()
+                                                                     .threadNamePrefix("sdk-async-response").build());
+            // Allow idle core threads to time out
+            executor.allowCoreThreadTimeOut(true);
+            managedResources.add(executor);
+            return executor;
+        };
+
+        return Optional.ofNullable(config)
+                       .map(c -> c.advancedOption(FUTURE_COMPLETION_EXECUTOR))
+                       .orElseGet(defaultExecutor);
+    }
+
     @Override
     public void close() {
-        clientBootstrap.close();
-        credentialProviderAdapter.close();
-        credentialsProvider.close();
+        managedResources.forEach(v -> IoUtils.closeIfCloseable(v, log.logger()));
+        managedResources.forEach(this::shutdownIfExecutorService);
+    }
+
+    private void shutdownIfExecutorService(Object object) {
+        if (object instanceof ExecutorService) {
+            ExecutorService executor = (ExecutorService) object;
+            executor.shutdown();
+        }
     }
 
     public static final class Builder {
@@ -100,6 +161,7 @@ public class S3NativeClientConfiguration implements SdkAutoCloseable {
         private Long partSizeInBytes;
         private Double targetThroughputInGbps;
         private Integer maxConcurrency;
+        private ClientAsyncConfiguration asynConfiguration;
 
         private Builder() {
         }
@@ -126,6 +188,11 @@ public class S3NativeClientConfiguration implements SdkAutoCloseable {
 
         public Builder maxConcurrency(Integer maxConcurrency) {
             this.maxConcurrency = maxConcurrency;
+            return this;
+        }
+
+        public Builder asyncConfiguration(ClientAsyncConfiguration asyncConfiguration) {
+            this.asynConfiguration = asyncConfiguration;
             return this;
         }
 

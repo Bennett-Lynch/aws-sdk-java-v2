@@ -38,10 +38,10 @@ import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.transfer.s3.internal.S3CrtAsyncClient;
-import software.amazon.awssdk.transfer.s3.util.ChecksumUtils;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.testutils.RandomTempFile;
+import software.amazon.awssdk.transfer.s3.internal.S3CrtAsyncClient;
+import software.amazon.awssdk.transfer.s3.util.ChecksumUtils;
 
 public class S3CrtClientPutObjectIntegrationTest extends S3IntegrationTestBase {
     private static final String TEST_BUCKET = temporaryBucketName(S3CrtClientPutObjectIntegrationTest.class);
