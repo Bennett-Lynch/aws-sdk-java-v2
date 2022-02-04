@@ -25,11 +25,15 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.reactivestreams.Subscriber;
 import software.amazon.awssdk.core.SdkResponse;
+import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.core.async.ResponsePublisher;
 import software.amazon.awssdk.core.async.SdkPublisher;
@@ -43,6 +47,7 @@ import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.testutils.RandomTempFile;
 import software.amazon.awssdk.utils.ImmutableMap;
+import software.amazon.awssdk.utils.async.LinesSubscriber;
 
 public class GetObjectAsyncIntegrationTest extends S3IntegrationTestBase {
 
@@ -56,15 +61,28 @@ public class GetObjectAsyncIntegrationTest extends S3IntegrationTestBase {
                                                                       .build();
 
     private static File file;
+    
+    // ByteBuffer a = ByteBuffer.wrap(RandomStringUtils.randomAlphanumeric(30000).getBytes());
 
     @BeforeClass
     public static void setupFixture() throws IOException {
         createBucket(BUCKET);
-        file = new RandomTempFile(10_000);
+        file = new RandomTempFile(10_00000);
+
         s3Async.putObject(PutObjectRequest.builder()
                                           .bucket(BUCKET)
                                           .key(KEY)
-                                          .build(), file.toPath());
+                                          .build(), AsyncRequestBody.fromString(
+            RandomStringUtils.randomAlphabetic(100_000) +
+            System.lineSeparator() +
+            RandomStringUtils.randomAlphabetic(100_000) +
+            System.lineSeparator()
+        ));
+        
+        // s3Async.putObject(PutObjectRequest.builder()
+        //                                   .bucket(BUCKET)
+        //                                   .key(KEY)
+        //                                   .build(), file.toPath());
 
         s3Async.waiter().waitUntilObjectExists(b -> b.bucket(BUCKET).key(KEY)).join();
     }
@@ -103,10 +121,13 @@ public class GetObjectAsyncIntegrationTest extends S3IntegrationTestBase {
     public void toPublisher() throws IOException {
         ResponsePublisher<GetObjectResponse> responsePublisher =
             s3Async.getObject(getObjectRequest, AsyncResponseTransformer.toPublisher()).join();
-        ByteBuffer buf = ByteBuffer.allocate(Math.toIntExact(responsePublisher.response().contentLength()));
-        CompletableFuture<Void> drainPublisherFuture = responsePublisher.subscribe(buf::put);
+        SdkPublisher<ByteBuffer> bytePublisher = responsePublisher;
+
+        
+        SdkPublisher<String> strPublisher = bytePublisher.map(b -> StandardCharsets.UTF_8.decode(b).toString());
+        SdkPublisher<List<String>> linePublisher = subscriber -> strPublisher.subscribe(new LinesSubscriber(subscriber));
+        CompletableFuture<Void> drainPublisherFuture = linePublisher.subscribe(System.out::println);
         drainPublisherFuture.join();
-        assertThat(buf.array()).isEqualTo(Files.readAllBytes(file.toPath()));
     }
 
     @Test
